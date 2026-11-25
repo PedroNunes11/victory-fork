@@ -597,6 +597,9 @@ impl TextureQueue {
     ///   uploaded whole is not in this list at all until a look finds it
     ///   changed (the looks themselves are [`TextureQueue::relooks_due`]).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         let mut stale: Vec<(u64, u32, u64)> = Vec::new();
@@ -610,23 +613,63 @@ impl TextureQueue {
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // A pass serves at most `max` slots. Select only the ends that can
+        // reach it before sorting: the queue commonly holds 25,000-40,000
+        // entries while one pass takes 4,096.
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        // The first found changed first (the frame of the look, then the
-        // slot's write).
-        stale.sort_unstable_by_key(|&(found, _, write)| (found, write));
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        if order.len() == max {
+            return order;
+        }
+
+        let count = (max - order.len()).min(fresh.len());
+        if count > 0 {
+            // Preserve the existing newest/oldest interleave without
+            // sorting entries that cannot be used by this pass.
+            let newer = count.div_ceil(2);
+            let older = count / 2;
+            if count < fresh.len() {
+                fresh.select_nth_unstable_by(newer, newest_first);
+                if older > 0 {
+                    let tail = fresh.len() - newer - older;
+                    fresh[newer..].select_nth_unstable_by(tail, newest_first);
+                }
+            }
+            let oldest_start = fresh.len() - older;
+            if count == fresh.len() {
+                fresh.sort_unstable_by(newest_first);
+            } else {
+                fresh[..newer].sort_unstable_by(newest_first);
+                fresh[oldest_start..].sort_unstable_by(newest_first);
+            }
+            order.reserve(count);
+            for (i, &(_, index, write)) in fresh[..newer].iter().enumerate() {
+                order.push((index, write));
+                if i < older {
+                    let (_, index, write) = fresh[fresh.len() - 1 - i];
+                    order.push((index, write));
+                }
             }
         }
-        order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
-        order.truncate(max);
+
+        // Stale entries come after every never-uploaded entry, oldest
+        // observed change first. Select only the remaining prefix.
+        let left = max - order.len();
+        if left > 0 {
+            let oldest_found = |a: &(u64, u32, u64), b: &(u64, u32, u64)| {
+                (a.0, a.2).cmp(&(b.0, b.2))
+            };
+            if stale.len() > left {
+                stale.select_nth_unstable_by(left, oldest_found);
+                stale.truncate(left);
+            }
+            stale.sort_unstable_by(oldest_found);
+            order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
+        }
         order
     }
 
